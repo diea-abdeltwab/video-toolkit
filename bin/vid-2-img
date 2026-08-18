@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+# =============================================================================
+# vid-2-img — video → image frames extractor
+#
+# Usage:
+#   vid-2-img <video>                    extract 1 frame/sec (default)
+#   vid-2-img <video> --fps 5            5 frames per second
+#   vid-2-img <video> --fps all          every single frame
+#   vid-2-img <video> --nth 10           every 10th frame
+#   vid-2-img <video> -s 0:30 -e 1:45   only this time range
+#   vid-2-img <video> --fmt png          PNG output (default: jpg)
+#   vid-2-img <video> --quality 85       JPEG quality 1-100 (default: 95)
+#   vid-2-img <video> --max 200          safety cap on frame count
+#   vid-2-img <video> -o ~/frames        custom output folder
+#   vid-2-img <video> --batch            no confirmation prompts
+#   vid-2-img <folder>                   pick a video from folder
+#   vid-2-img <folder> -r                pick from folder recursively
+#   vid-2-img --info <video>             show video info and exit
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    GRN=$'\033[0;32m'; YLW=$'\033[0;33m'; RED=$'\033[0;31m'
+    BLU=$'\033[0;34m'; CYN=$'\033[0;36m'; MAG=$'\033[0;35m'
+    BLD=$'\033[1m';    DIM=$'\033[2m';    RST=$'\033[0m'
+else
+    GRN=""; YLW=""; RED=""; BLU=""; CYN=""; MAG=""
+    BLD=""; DIM="";  RST=""
+fi
+
+log_info() { echo -e "${BLU}[*]${RST} $*"; }
+log_ok()   { echo -e "${GRN}[+]${RST} $*"; }
+log_warn() { echo -e "${YLW}[!]${RST} $*"; }
+log_err()  { echo -e "${RED}[!]${RST} $*" >&2; }
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+_missing=()
+command -v ffmpeg  &>/dev/null || _missing+=("ffmpeg")
+command -v ffprobe &>/dev/null || _missing+=("ffprobe")
+if [[ ${#_missing[@]} -gt 0 ]]; then
+    log_err "Missing required tool(s): ${_missing[*]}"
+    echo    "  Ubuntu/Debian : sudo apt install ffmpeg"
+    echo    "  macOS         : brew install ffmpeg"
+    exit 1
+fi
+
+# ── Supported video extensions ────────────────────────────────────────────────
+VIDEO_EXTS="mp4 avi mov mkv wmv flv webm m4v 3gp mpg mpeg asf rm rmvb vob ogv dv ts mts m2ts"
+
+is_video() { local e="${1##*.}"; [[ " $VIDEO_EXTS " == *" ${e,,} "* ]]; }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${BLD}vid-2-img${RST} v${VERSION} — video → image frames extractor
+
+${BLD}USAGE${RST}
+  vid-2-img <video|folder> [options]
+
+${BLD}TIME FORMATS${RST}
+  HH:MM:SS   e.g.  1:20:05
+  MM:SS      e.g.  3:45
+  seconds    e.g.  225
+
+${BLD}OPTIONS${RST}
+  --fps   <N|all>   Frames per second to extract, or 'all'  (default: 1)
+  --nth   <N>       Extract every Nth frame  (overrides --fps)
+  -s, --start TIME  Start time  (default: beginning)
+  -e, --end   TIME  End time    (default: end)
+  --fmt   <fmt>     Output format: jpg | png              (default: jpg)
+  --quality <1-100> JPEG quality                          (default: 95)
+  --max   <N>       Safety cap on number of frames        (default: 500, 0=off)
+  -o, --output DIR  Output directory  (default: ./<name>_<mode>/)
+  -r, --recursive   Search sub-folders when given a folder
+  --batch           Skip all confirmation prompts
+  --info <video>    Show video info and exit
+  -v, --version     Show version and exit
+  -h, --help        Show this help
+
+${BLD}EXAMPLES${RST}
+  vid-2-img video.mp4
+  vid-2-img video.mp4 --fps 5 --fmt png
+  vid-2-img video.mp4 --fps all --batch
+  vid-2-img video.mp4 -s 0:30 -e 1:45 --quality 85
+  vid-2-img video.mp4 --nth 10 -o ~/frames
+  vid-2-img ~/Videos -r
+  vid-2-img --info video.mp4
+EOF
+}
+
+# ── Parse time → seconds (integer) ───────────────────────────────────────────
+to_seconds() {
+    local t="$1"
+    if [[ "$t" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+        echo $(( BASH_REMATCH[1]*3600 + BASH_REMATCH[2]*60 + BASH_REMATCH[3] ))
+    elif [[ "$t" =~ ^([0-9]+):([0-9]+)$ ]]; then
+        echo $(( BASH_REMATCH[1]*60 + BASH_REMATCH[2] ))
+    elif [[ "$t" =~ ^[0-9]+$ ]]; then
+        echo "$t"
+    else
+        log_err "Bad time format: '$t'  (use HH:MM:SS, MM:SS, or seconds)"
+        exit 1
+    fi
+}
+
+# ── Format seconds → HH:MM:SS ────────────────────────────────────────────────
+fmt_time() {
+    local t=${1%%.*}
+    printf "%02d:%02d:%02d" $(( t/3600 )) $(( (t%3600)/60 )) $(( t%60 ))
+}
+
+# ── Format bytes / MB ─────────────────────────────────────────────────────────
+fmt_size() {
+    awk -v mb="$1" 'BEGIN {
+        if      (mb < 1)    printf "%.0f KB", mb*1024
+        else if (mb < 1024) printf "%.1f MB", mb
+        else                printf "%.2f GB", mb/1024
+    }'
+}
+
+# ── Sanitise a string for use as a filename ───────────────────────────────────
+sanitise() {
+    local s="$1"
+    s="${s//[\/\\:\"\'<>|?*$'\t'$'\n']/_}"   # replace bad chars
+    s="${s// /_}"                              # spaces → underscore
+    s=$(echo "$s" | tr -s '_')                # collapse runs of _
+    s="${s#_}"; s="${s%_}"                     # strip leading/trailing _
+    echo "${s:0:200}"
+}
+
+# ── Make a directory name that doesn't already exist ─────────────────────────
+unique_dir() {
+    local base="$1" p="$1" n=1
+    while [[ -e "$p" ]]; do p="${base}_${n}"; (( n++ )); done
+    echo "$p"
+}
+
+# ── Show video info via ffprobe ───────────────────────────────────────────────
+show_info() {
+    local file="$1"
+    [[ -f "$file" ]] || { log_err "File not found: $file"; exit 1; }
+
+    local raw
+    raw=$(ffprobe -v error \
+        -show_entries "format=duration,size,bit_rate : \
+                       stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels" \
+        -print_format json "$file" 2>/dev/null)
+
+    echo
+    log_info "Video info: ${CYN}$(basename "$file")${RST}"
+    echo
+
+    echo "$raw" | awk '
+    /"duration"/    { gsub(/[",]/,"",$2); dur=$2+0 }
+    /"size"/        { gsub(/[",]/,"",$2); size=$2+0 }
+    /"bit_rate"/    { gsub(/[",]/,"",$2); if(br+0==0) br=$2+0 }
+    /"codec_type": "video"/ { vblock=1; ablock=0 }
+    /"codec_type": "audio"/ { ablock=1; vblock=0 }
+    vblock && /"codec_name"/  { gsub(/[",]/,"",$2); if(vc=="") vc=$2 }
+    vblock && /"width"/       { gsub(/[",]/,"",$2); if(w+0==0) w=$2+0 }
+    vblock && /"height"/      { gsub(/[",]/,"",$2); if(h+0==0) h=$2+0 }
+    vblock && /"r_frame_rate"/ {
+        gsub(/[",]/,"",$2); split($2,a,"/")
+        if(a[2]+0>0 && fps+0==0) fps=a[1]/a[2]
+    }
+    ablock && /"codec_name"/  { gsub(/[",]/,"",$2); if(ac=="") ac=$2 }
+    ablock && /"sample_rate"/ { gsub(/[",]/,"",$2); if(sr+0==0) sr=$2+0 }
+    ablock && /"channels"/    { gsub(/[",]/,"",$2); if(ch+0==0) ch=$2+0 }
+    END {
+        h_d=int(dur/3600); m_d=int((dur%3600)/60); s_d=int(dur%60)
+        printf "  %-12s %02d:%02d:%02d  (%.2fs)\n", "Duration :", h_d, m_d, s_d, dur
+        printf "  %-12s %.1f MB\n",   "Size :",    size/1048576
+        printf "  %-12s %d kbps\n",   "Bitrate :", int(br/1000)
+        printf "  %-12s %s  %dx%d  %.2f fps\n", "Video :", vc, w, h, fps
+        if (ac != "") printf "  %-12s %s  %d Hz  %dch\n", "Audio :", ac, sr, ch
+        printf "  %-12s ~%.0f\n",     "Frames ~:", fps * dur
+    }'
+    echo
+}
+
+# ── Browse & pick a video from a folder ───────────────────────────────────────
+pick_from_folder() {
+    local folder="$1" recursive="$2"
+    log_info "Scanning: ${CYN}${folder}${RST}" >&2
+
+    # collect files
+    local -a files=()
+    if [[ "$recursive" == "1" ]]; then
+        while IFS= read -r f; do
+            is_video "$f" && files+=("$f")
+        done < <(find "$folder" -type f | sort)
+    else
+        while IFS= read -r f; do
+            is_video "$f" && files+=("$f")
+        done < <(find "$folder" -maxdepth 1 -type f | sort)
+    fi
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_err "No video files found in: $folder"
+        exit 1
+    fi
+
+    # optional size filter when list is long
+    local -a display_files=("${files[@]}")
+    if [[ ${#files[@]} -gt 50 ]]; then
+        log_warn "Found ${#files[@]} videos." >&2
+        echo -e "  Filter: ${BLD}(1)${RST} show all  ${BLD}(2)${RST} >10 MB  ${BLD}(3)${RST} >100 MB" >&2
+        read -rp "  Choice [1]: " flt </dev/tty
+        case "$flt" in
+            2) display_files=()
+               for f in "${files[@]}"; do
+                   local sz; sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+                   (( sz > 10*1024*1024 )) && display_files+=("$f")
+               done ;;
+            3) display_files=()
+               for f in "${files[@]}"; do
+                   local sz; sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+                   (( sz > 100*1024*1024 )) && display_files+=("$f")
+               done ;;
+        esac
+    fi
+
+    # print table — all to stderr so stdout stays clean for the returned path
+    {
+        echo
+        printf "  %4s  %-48s  %10s\n" "#" "Name" "Size"
+        echo "  $(printf '─%.0s' {1..66})"
+        local i=1
+        for f in "${display_files[@]}"; do
+            local name sz sz_mb sz_fmt
+            name=$(basename "$f")
+            sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+            sz_mb=$(awk -v s="$sz" 'BEGIN { printf "%.2f", s/1048576 }')
+            sz_fmt=$(fmt_size "$sz_mb")
+            # truncate long names
+            [[ ${#name} -gt 48 ]] && name="${name:0:45}..."
+            printf "  %4d  %-48s  %10s\n" "$i" "$name" "$sz_fmt"
+            (( i++ ))
+        done
+        echo "  $(printf '─%.0s' {1..66})"
+        echo "     0  ← cancel"
+        echo
+    } >&2
+
+    local choice
+    while true; do
+        read -rp "  Pick (0–${#display_files[@]}): " choice </dev/tty
+        if [[ "$choice" == "0" ]]; then
+            log_info "Cancelled." >&2
+            exit 0
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#display_files[@]} )); then
+            local picked="${display_files[$(( choice - 1 ))]}"
+            log_ok "Selected: ${CYN}$(basename "$picked")${RST}" >&2
+            echo "$picked"   # ← stdout only: the path
+            return
+        fi
+        log_warn "Enter a number between 0 and ${#display_files[@]}." >&2
+    done
+}
+
+# ── Progress bar ──────────────────────────────────────────────────────────────
+SPIN="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_spin_i=0
+_prog_start=0
+
+progress_start() { _prog_start=$SECONDS; }
+
+show_progress() {
+    local cur=$1 total=$2
+    local spin="${SPIN:$(( _spin_i % ${#SPIN} )):1}"
+    (( _spin_i++ )) || true
+
+    local pct filled bar i color
+    if (( total > 0 )); then
+        pct=$(( cur * 100 / total ))
+        filled=$(( cur * 40 / total ))
+    else
+        pct=0; filled=0
+    fi
+
+    bar=""
+    for (( i=0; i<40; i++ )); do
+        if (( i < filled )); then
+            if   (( i < 10 )); then color=$RED
+            elif (( i < 20 )); then color=$YLW
+            elif (( i < 30 )); then color=$CYN
+            else                    color=$GRN
+            fi
+            bar+="${color}█${RST}"
+        else
+            bar+="${DIM}░${RST}"
+        fi
+    done
+
+    local elapsed=$(( SECONDS - _prog_start ))
+    local spd eta_str
+    if (( elapsed > 0 && cur > 0 )); then
+        spd=$(awk -v c="$cur" -v e="$elapsed" 'BEGIN { printf "%.1f", c/e }')
+        local remaining; remaining=$(( total > cur ? total - cur : 0 ))
+        local eta_sec; eta_sec=$(awk -v r="$remaining" -v s="$spd" 'BEGIN { if(s>0) printf "%d", r/s; else print "?" }')
+        if [[ "$eta_sec" =~ ^[0-9]+$ ]]; then
+            eta_str=$(fmt_time "$eta_sec")
+        else
+            eta_str="--:--:--"
+        fi
+    else
+        spd="0.0"
+        eta_str="--:--:--"
+    fi
+
+    printf "\r  ${CYN}%s${RST} %s  ${MAG}%3d%%${RST}  ${BLD}%d${RST}/%d  ${GRN}%s f/s${RST}  ETA %s   " \
+        "$spin" "$bar" "$pct" "$cur" "$total" "$spd" "$eta_str" >&2
+}
+
+# ── Core extraction via ffmpeg ────────────────────────────────────────────────
+extract_frames() {
+    local video="$1"
+    local out_dir="$2"
+    local fps_val="$3"     # numeric fps OR "all"
+    local every_nth="$4"   # 0 = not set
+    local start_s="$5"
+    local end_s="$6"
+    local fmt="$7"
+    local quality="$8"
+    local max_frames="$9"
+    local batch="${10}"
+
+    # ── get video info ─────────────────────────────────────────────────────────
+    local probe
+    probe=$(ffprobe -v error \
+        -show_entries "format=duration : stream=r_frame_rate,width,height,codec_type" \
+        -print_format json "$video" 2>/dev/null)
+
+    local dur fps_n fps_d vid_fps width height
+    dur=$(echo  "$probe" | grep -oP '"duration":\s*"\K[0-9.]+' | head -1)
+    [[ -z "$dur" ]] && dur=$(echo "$probe" | grep -oP '"duration":\s*\K[0-9.]+' | head -1)
+    dur=${dur:-0}
+
+    local fps_raw
+    fps_raw=$(echo "$probe" | awk '
+        /"codec_type": "video"/ { found=1 }
+        found && /"r_frame_rate"/ { gsub(/[",]/,"",$2); print $2; exit }
+    ')
+    if [[ "$fps_raw" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        fps_n=${BASH_REMATCH[1]}; fps_d=${BASH_REMATCH[2]}
+        vid_fps=$(awk -v n="$fps_n" -v d="$fps_d" 'BEGIN { printf "%.4f", (d>0)?n/d:0 }')
+    else
+        vid_fps="25.0000"
+    fi
+
+    width=$( echo "$probe" | grep -oP '"width":\s*\K[0-9]+' | head -1); width=${width:-0}
+    height=$(echo "$probe" | grep -oP '"height":\s*\K[0-9]+'| head -1); height=${height:-0}
+
+    local dur_int=${dur%%.*}
+    if (( dur_int <= 0 )); then
+        log_err "Cannot determine video duration — is the file valid?"
+        exit 1
+    fi
+
+    # ── resolve time range ─────────────────────────────────────────────────────
+    local start_sec=${start_s:-0}
+    local end_sec=${end_s:-$dur_int}
+
+    if (( start_sec >= end_sec )); then
+        log_err "Start time must be before end time."
+        exit 1
+    fi
+    if (( end_sec > dur_int + 1 )); then
+        log_warn "End time exceeds duration ($(fmt_time "$dur_int")) — clamping."
+        end_sec=$dur_int
+    fi
+    local clip_sec=$(( end_sec - start_sec ))
+
+    # ── resolve fps / nth ──────────────────────────────────────────────────────
+    local extract_all=0
+    local vf_filter=""
+    local estimated=0
+
+    if (( every_nth > 0 )); then
+        # -vf "select=not(mod(n\,N))" 
+        vf_filter="select=not(mod(n\\,${every_nth})),setpts=N/FRAME_RATE/TB"
+        estimated=$(awk -v fps="$vid_fps" -v d="$clip_sec" -v n="$every_nth" \
+            'BEGIN { printf "%d", fps*d/n }')
+    elif [[ "$fps_val" == "all" ]]; then
+        extract_all=1
+        estimated=$(awk -v fps="$vid_fps" -v d="$clip_sec" \
+            'BEGIN { printf "%d", fps*d }')
+    else
+        vf_filter="fps=${fps_val}"
+        estimated=$(awk -v f="$fps_val" -v d="$clip_sec" \
+            'BEGIN { printf "%d", f*d }')
+    fi
+
+    # ── apply max_frames cap ───────────────────────────────────────────────────
+    if (( max_frames > 0 && estimated > max_frames && extract_all == 0 )); then
+        local new_nth
+        new_nth=$(awk -v fps="$vid_fps" -v d="$clip_sec" -v m="$max_frames" \
+            'BEGIN { printf "%d", int(fps*d/m) + 1 }')
+        log_warn "Estimated ${estimated} frames exceeds cap (${max_frames}) — extracting every ${new_nth} frames instead."
+        vf_filter="select=not(mod(n\\,${new_nth})),setpts=N/FRAME_RATE/TB"
+        estimated=$max_frames
+    fi
+
+    # ── confirm all-frames mode ────────────────────────────────────────────────
+    if (( extract_all == 1 && batch == 0 )); then
+        log_warn "ALL-FRAMES mode will extract ~${estimated} frames!"
+        read -rp "  Continue? (y/n): " ans
+        [[ "${ans,,}" == "y" ]] || { log_info "Cancelled."; exit 0; }
+    fi
+
+    # ── estimate disk usage ────────────────────────────────────────────────────
+    local est_mb
+    if [[ "$fmt" == "png" ]]; then
+        est_mb=$(awk -v n="$estimated" -v w="$width" -v h="$height" \
+            'BEGIN { printf "%.1f", n*w*h*4*0.7/1048576 }')
+    else
+        # quality-based ratio
+        local ratio
+        ratio=$(awk -v q="$quality" 'BEGIN {
+            if      (q>=95) r=0.15
+            else if (q>=90) r=0.12
+            else if (q>=85) r=0.10
+            else if (q>=80) r=0.08
+            else if (q>=75) r=0.07
+            else            r=0.05
+            printf "%.2f", r
+        }')
+        est_mb=$(awk -v n="$estimated" -v w="$width" -v h="$height" -v r="$ratio" \
+            'BEGIN { printf "%.1f", n*w*h*3*r/1048576 }')
+    fi
+
+    # ── print job summary ──────────────────────────────────────────────────────
+    local stem; stem=$(sanitise "$(basename "${video%.*}")")
+    local out_fmt_flag quality_opts=()
+    if [[ "$fmt" == "png" ]]; then
+        out_fmt_flag="png"
+    else
+        out_fmt_flag="mjpeg"
+        quality_opts=(-q:v "$(awk -v q="$quality" 'BEGIN { printf "%d", int((100-q)*31/100)+1 }')")
+    fi
+
+    mkdir -p "$out_dir"
+
+    {
+        echo
+        echo -e "  ${BLD}vid-2-img${RST}"
+        echo -e "  ${CYN}Input     ${RST}: $(basename "$video")  (${width}x${height}  $(awk -v f="$vid_fps" 'BEGIN{printf "%.2f",f}') fps)"
+        echo -e "  ${CYN}Range     ${RST}: $(fmt_time "$start_sec") → $(fmt_time "$end_sec")  ($(fmt_time "$clip_sec"))"
+        if (( every_nth > 0 )); then
+            echo -e "  ${CYN}Mode      ${RST}: every ${every_nth}th frame"
+        elif [[ "$fps_val" == "all" ]]; then
+            echo -e "  ${CYN}Mode      ${RST}: all frames"
+        else
+            echo -e "  ${CYN}Mode      ${RST}: ${fps_val} frame(s)/sec"
+        fi
+        echo -e "  ${CYN}Est.frames${RST}: ~${estimated}"
+        echo -e "  ${CYN}Format    ${RST}: ${fmt^^}  quality=${quality}"
+        echo -e "  ${CYN}Est. size ${RST}: ~$(fmt_size "$est_mb")"
+        echo -e "  ${CYN}Output    ${RST}: ${out_dir}"
+        echo
+    } >&2
+
+    # ── build ffmpeg command ───────────────────────────────────────────────────
+    local -a cmd=(
+        ffmpeg -hide_banner -loglevel error
+        -ss "$start_sec"
+        -t  "$clip_sec"
+        -i  "$video"
+    )
+
+    if [[ -n "$vf_filter" ]]; then
+        cmd+=(-vf "$vf_filter")
+    fi
+
+    cmd+=(
+        -vcodec "$out_fmt_flag"
+        "${quality_opts[@]}"
+        -an                           # no audio
+        -frame_pts 1                  # use real PTS in filename (unique)
+        "${out_dir}/${stem}_frame_%08d.${fmt}"
+    )
+
+    # ── run with live progress ─────────────────────────────────────────────────
+    progress_start
+    "${cmd[@]}" &
+    local ffmpeg_pid=$!
+
+    while kill -0 "$ffmpeg_pid" 2>/dev/null; do
+        local count
+        count=$(find "$out_dir" -maxdepth 1 -name "*.${fmt}" | wc -l)
+        show_progress "$count" "$estimated"
+        sleep 0.3
+    done
+
+    wait "$ffmpeg_pid"
+    local rc=$?
+    echo >&2  # newline after progress bar
+
+    if (( rc != 0 )); then
+        log_err "ffmpeg exited with error (code ${rc})."
+        exit 1
+    fi
+
+    # actual count
+    local actual
+    actual=$(find "$out_dir" -maxdepth 1 -name "*.${fmt}" | wc -l)
+    echo "$actual"
+}
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+INPUT=""
+FPS_VAL="1"
+EVERY_NTH=0
+START_RAW=""
+END_RAW=""
+FMT="jpg"
+QUALITY=95
+MAX_FRAMES=500
+OUTPUT_BASE="${PWD}"
+RECURSIVE=0
+BATCH=0
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage; exit 0 ;;
+        -v|--version) echo "vid-2-img $VERSION"; exit 0 ;;
+        --info)
+            [[ $# -lt 2 ]] && { log_err "--info requires a video path"; exit 1; }
+            show_info "$2"; exit 0 ;;
+        --fps)
+            [[ $# -lt 2 ]] && { log_err "--fps requires a value"; exit 1; }
+            FPS_VAL="$2"; shift ;;
+        --nth)
+            [[ $# -lt 2 ]] && { log_err "--nth requires a value"; exit 1; }
+            EVERY_NTH="$2"; shift ;;
+        -s|--start)
+            [[ $# -lt 2 ]] && { log_err "--start requires a value"; exit 1; }
+            START_RAW="$2"; shift ;;
+        -e|--end)
+            [[ $# -lt 2 ]] && { log_err "--end requires a value"; exit 1; }
+            END_RAW="$2"; shift ;;
+        --fmt)
+            [[ $# -lt 2 ]] && { log_err "--fmt requires a value"; exit 1; }
+            case "$2" in
+                jpg|png) FMT="$2" ;;
+                *) log_err "--fmt must be jpg or png"; exit 1 ;;
+            esac
+            shift ;;
+        --quality)
+            [[ $# -lt 2 ]] && { log_err "--quality requires a value"; exit 1; }
+            QUALITY="$2"
+            if ! [[ "$QUALITY" =~ ^[0-9]+$ ]] || (( QUALITY < 1 || QUALITY > 100 )); then
+                log_err "--quality must be 1-100"; exit 1
+            fi
+            shift ;;
+        --max)
+            [[ $# -lt 2 ]] && { log_err "--max requires a value"; exit 1; }
+            MAX_FRAMES="$2"; shift ;;
+        -o|--output)
+            [[ $# -lt 2 ]] && { log_err "--output requires a value"; exit 1; }
+            OUTPUT_BASE="$2"; shift ;;
+        -r|--recursive) RECURSIVE=1 ;;
+        --batch)        BATCH=1 ;;
+        -*)
+            log_err "Unknown option: $1"; echo; usage; exit 1 ;;
+        *)
+            if [[ -z "$INPUT" ]]; then INPUT="$1"
+            else log_err "Unexpected argument: $1"; exit 1; fi ;;
+    esac
+    shift
+done
+
+# ── Validate --fps ─────────────────────────────────────────────────────────────
+if [[ "$FPS_VAL" != "all" ]] && ! [[ "$FPS_VAL" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    log_err "--fps must be a positive number or 'all'"; exit 1
+fi
+
+# ── Validate --nth ────────────────────────────────────────────────────────────
+if ! [[ "$EVERY_NTH" =~ ^[0-9]+$ ]]; then
+    log_err "--nth must be a positive integer"; exit 1
+fi
+
+# ── Validate input ────────────────────────────────────────────────────────────
+[[ -z "$INPUT" ]] && { log_err "No input specified."; echo; usage; exit 1; }
+
+# strip surrounding quotes (drag-and-drop)
+INPUT="${INPUT#\'}"; INPUT="${INPUT%\'}";
+INPUT="${INPUT#\"}"; INPUT="${INPUT%\"}";
+
+[[ -e "$INPUT" ]] || { log_err "Path not found: $INPUT"; exit 1; }
+
+# ── Resolve input: file or folder ─────────────────────────────────────────────
+if [[ -d "$INPUT" ]]; then
+    VIDEO=$(pick_from_folder "$INPUT" "$RECURSIVE")
+    [[ -z "$VIDEO" ]] && exit 0
+else
+    VIDEO="$INPUT"
+    if ! is_video "$VIDEO"; then
+        log_warn "Unrecognised extension — trying anyway."
+    fi
+fi
+
+[[ -f "$VIDEO" ]] || { log_err "File not found: $VIDEO"; exit 1; }
+
+# ── Resolve time range ────────────────────────────────────────────────────────
+START_SEC=""
+END_SEC=""
+[[ -n "$START_RAW" ]] && START_SEC=$(to_seconds "$START_RAW")
+[[ -n "$END_RAW"   ]] && END_SEC=$(to_seconds "$END_RAW")
+
+# ── Build output directory ────────────────────────────────────────────────────
+STEM=$(sanitise "$(basename "${VIDEO%.*}")")
+if [[ "$FPS_VAL" == "all" ]]; then
+    SUFFIX="all"
+elif (( EVERY_NTH > 0 )); then
+    SUFFIX="nth${EVERY_NTH}"
+else
+    SUFFIX="${FPS_VAL}fps"
+fi
+
+OUT_DIR=$(unique_dir "${OUTPUT_BASE}/${STEM}_${SUFFIX}")
+
+# ── Trap: clean up on Ctrl-C ──────────────────────────────────────────────────
+trap '
+    echo
+    log_warn "Interrupted."
+    if [[ -d "$OUT_DIR" ]] && [[ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]]; then
+        if [[ "$BATCH" == "1" ]]; then
+            rm -rf "$OUT_DIR"
+            log_info "Partial output removed."
+        else
+            read -rp "  Keep partial output? (y/n): " _keep
+            [[ "${_keep,,}" != "y" ]] && rm -rf "$OUT_DIR" && log_info "Partial output removed."
+        fi
+    fi
+    exit 130
+' INT
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+t0=$SECONDS
+
+SAVED=$(extract_frames \
+    "$VIDEO" "$OUT_DIR" "$FPS_VAL" "$EVERY_NTH" \
+    "$START_SEC" "$END_SEC" \
+    "$FMT" "$QUALITY" "$MAX_FRAMES" "$BATCH")
+
+elapsed=$(( SECONDS - t0 ))
+elapsed_fmt=$(fmt_time "$elapsed")
+
+# actual disk usage
+actual_bytes=$(du -sb "$OUT_DIR" 2>/dev/null | cut -f1 || du -sk "$OUT_DIR" 2>/dev/null | awk '{print $1*1024}' || echo 0)
+actual_mb=$(awk -v b="$actual_bytes" 'BEGIN { printf "%.2f", b/1048576 }')
+actual_sz=$(fmt_size "$actual_mb")
+
+echo
+log_ok "${BLD}${SAVED} frames${RST}  saved → ${CYN}${OUT_DIR}${RST}"
+log_ok "Size: ${actual_sz}   Time: ${elapsed_fmt}"
+echo
+
+# ── Offer to open output folder ───────────────────────────────────────────────
+if [[ "$BATCH" != "1" ]]; then
+    read -rp "  Open output folder? (y/n): " _open
+    if [[ "${_open,,}" == "y" ]]; then
+        if command -v xdg-open &>/dev/null; then
+            xdg-open "$OUT_DIR" &>/dev/null &
+        elif command -v open &>/dev/null; then
+            open "$OUT_DIR" &
+        fi
+    fi
+fi

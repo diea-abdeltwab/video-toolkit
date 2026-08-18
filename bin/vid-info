@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+# =============================================================================
+# vid-info — video file info scanner
+#
+# Usage:
+#   vid-info <video>                 show info for one file
+#   vid-info <folder>                scan all videos in a folder
+#   vid-info <folder> -r             recursive scan (sub-folders too)
+#   vid-info <folder> --min 100      only show videos >= 100 MB
+#   vid-info <folder> --sort size    sort by size (name|size|dur|fps)
+#   vid-info <folder> --json         output as JSON (for scripting)
+#   vid-info <folder> -j 4           use 4 parallel jobs
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="3.0.0"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    GRN=$'\033[0;32m'; YLW=$'\033[0;33m'; RED=$'\033[0;31m'
+    BLU=$'\033[0;34m'; CYN=$'\033[0;36m'; MAG=$'\033[0;35m'
+    BLD=$'\033[1m';    DIM=$'\033[2m';     RST=$'\033[0m'
+    WHT=$'\033[0;37m'
+else
+    GRN=""; YLW=""; RED=""; BLU=""; CYN=""; MAG=""
+    BLD=""; DIM="";  RST=""; WHT=""
+fi
+
+log_info() { echo -e "${BLU}[*]${RST} $*" >&2; }
+log_ok()   { echo -e "${GRN}[+]${RST} $*" >&2; }
+log_warn() { echo -e "${YLW}[!]${RST} $*" >&2; }
+log_err()  { echo -e "${RED}[!]${RST} $*" >&2; }
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+_missing=()
+command -v ffprobe &>/dev/null || _missing+=("ffprobe")
+# jq is optional — only needed for --json
+if [[ ${#_missing[@]} -gt 0 ]]; then
+    log_err "Missing required tool(s): ${_missing[*]}"
+    echo    "  Ubuntu/Debian : sudo apt install ffmpeg"
+    echo    "  macOS         : brew install ffmpeg"
+    exit 1
+fi
+
+# ── Supported formats ─────────────────────────────────────────────────────────
+VIDEO_EXTS="mp4 avi mov mkv wmv flv webm m4v 3gp mpg mpeg asf rm rmvb vob ogv dv ts mts m2ts"
+
+is_video() {
+    local ext="${1##*.}"
+    ext="${ext,,}"    # lowercase
+    [[ " $VIDEO_EXTS " == *" $ext "* ]]
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${BLD}vid-info${RST} v${VERSION} — video file info scanner
+
+${BLD}USAGE${RST}
+  vid-info <video|folder> [options]
+
+${BLD}OPTIONS${RST}
+  -r, --recursive      Scan sub-folders too
+  --min <MB>           Skip files smaller than N MB  (default: 0)
+  --sort <key>         Sort results by: name | size | dur | fps  (default: name)
+  -j, --jobs <N>       Parallel scan jobs  (default: auto)
+  --json               Output raw JSON (for scripting / piping)
+  -v, --version        Show version and exit
+  -h, --help           Show this help
+
+${BLD}EXAMPLES${RST}
+  vid-info video.mp4
+  vid-info ~/Videos
+  vid-info ~/Videos -r
+  vid-info ~/Videos --min 50 --sort size
+  vid-info ~/Videos --json | jq '.[].name'
+EOF
+}
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+INPUT=""
+RECURSIVE=0
+MIN_MB=0
+SORT_KEY="name"
+JSON_OUT=0
+JOBS=$(( $(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4) ))
+JOBS=$(( JOBS > 8 ? 8 : JOBS ))   # cap at 8
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)       usage; exit 0 ;;
+        -v|--version)    echo "vid-info $VERSION"; exit 0 ;;
+        -r|--recursive)  RECURSIVE=1 ;;
+        --json)          JSON_OUT=1 ;;
+        --min)
+            [[ $# -lt 2 ]] && { log_err "--min requires a value"; exit 1; }
+            MIN_MB="$2"; shift ;;
+        --sort)
+            [[ $# -lt 2 ]] && { log_err "--sort requires a value"; exit 1; }
+            case "$2" in
+                name|size|dur|fps) SORT_KEY="$2" ;;
+                *) log_err "--sort must be one of: name, size, dur, fps"; exit 1 ;;
+            esac
+            shift ;;
+        -j|--jobs)
+            [[ $# -lt 2 ]] && { log_err "--jobs requires a value"; exit 1; }
+            JOBS="$2"; shift ;;
+        -*)
+            log_err "Unknown option: $1"; echo; usage; exit 1 ;;
+        *)
+            if [[ -z "$INPUT" ]]; then INPUT="$1"
+            else log_err "Unexpected argument: $1"; echo; usage; exit 1; fi ;;
+    esac
+    shift
+done
+
+[[ -z "$INPUT" ]] && { log_err "No input specified."; echo; usage; exit 1; }
+
+# Strip surrounding quotes (drag-and-drop on some terminals)
+INPUT="${INPUT#\'}" INPUT="${INPUT%\'}"
+INPUT="${INPUT#\"}" INPUT="${INPUT%\"}"
+
+[[ -e "$INPUT" ]] || { log_err "Path not found: $INPUT"; exit 1; }
+
+# ── ffprobe: get info for one file → JSON line ────────────────────────────────
+probe_file() {
+    local file="$1"
+    local raw
+    raw=$(ffprobe -v error \
+        -show_entries \
+          "format=duration,size,bit_rate,format_name : \
+           stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels,bit_rate" \
+        -print_format json "$file" 2>/dev/null) || return 1
+
+    # Parse with awk (no python / jq dependency)
+    awk -v file="$file" '
+    BEGIN { dur=0; size=0; br=0; fmt=""; vcodec=""; w=0; h=0; fps_n=0; fps_d=1
+            acodec=""; arate=0; ach=0; abr=0; in_video=0; in_audio=0 }
+
+    /"format_name"/   { gsub(/[",]/,"",$2); fmt=$2 }
+    /"duration"/      {
+        gsub(/[",]/,"",$2)
+        if (dur==0 && $2+0>0) dur=$2+0
+    }
+    /"size"/          { gsub(/[",]/,"",$2); if(size==0) size=$2+0 }
+    /"bit_rate"/      { gsub(/[",]/,"",$2); if(br==0 && $2+0>0) br=$2+0 }
+
+    /"codec_type": "video"/ { in_video=1; in_audio=0 }
+    /"codec_type": "audio"/ { in_audio=1; in_video=0 }
+
+    in_video && /"codec_name"/ { gsub(/[",]/,"",$2); if(vcodec=="") vcodec=$2 }
+    in_video && /"width"/      { gsub(/[",]/,"",$2); if(w==0) w=$2+0 }
+    in_video && /"height"/     { gsub(/[",]/,"",$2); if(h==0) h=$2+0 }
+    in_video && /"r_frame_rate"/ {
+        gsub(/[",]/,"",$2)
+        n=split($2,a,"/")
+        if(n==2 && a[2]+0>0 && fps_n==0) { fps_n=a[1]+0; fps_d=a[2]+0 }
+    }
+
+    in_audio && /"codec_name"/   { gsub(/[",]/,"",$2); if(acodec=="") acodec=$2 }
+    in_audio && /"sample_rate"/  { gsub(/[",]/,"",$2); if(arate==0)  arate=$2+0 }
+    in_audio && /"channels"/     { gsub(/[",]/,"",$2); if(ach==0)    ach=$2+0 }
+    in_audio && /"bit_rate"/     {
+        gsub(/[",]/,"",$2)
+        if(abr==0 && $2+0>0) abr=$2+0
+    }
+
+    END {
+        fps = (fps_d>0) ? fps_n/fps_d : 0
+        size_mb = size / 1048576
+        br_kbps = (br>0) ? int(br/1000) : 0
+
+        # duration fallback from frames if needed (rare)
+        h_dur = int(dur/3600)
+        m_dur = int((dur%3600)/60)
+        s_dur = int(dur%60)
+        dur_str = sprintf("%02d:%02d:%02d", h_dur, m_dur, s_dur)
+
+        res = (w>0 && h>0) ? w"x"h : "?"
+
+        # escape backslashes and double-quotes in file path for valid JSON
+        gsub(/\\/, "\\\\", file); gsub(/"/, "\\\"", file)
+        printf "{\"file\":\"%s\",\"dur\":%.3f,\"dur_str\":\"%s\",\"size_mb\":%.2f,\"br_kbps\":%d," \
+               "\"fmt\":\"%s\",\"vcodec\":\"%s\",\"res\":\"%s\",\"w\":%d,\"h\":%d,\"fps\":%.3f," \
+               "\"acodec\":\"%s\",\"arate\":%d,\"ach\":%d,\"abr_kbps\":%d}\n",
+               file, dur, dur_str, size_mb, br_kbps,
+               fmt, vcodec, res, w, h, fps,
+               acodec, arate, ach, int(abr/1000)
+    }
+    ' <<< "$raw"
+}
+
+# ── Collect video files ────────────────────────────────────────────────────────
+collect_files() {
+    local dir="$1"
+    if [[ $RECURSIVE -eq 1 ]]; then
+        find "$dir" -type f | sort
+    else
+        find "$dir" -maxdepth 1 -type f | sort
+    fi
+}
+
+# ── Format helpers ────────────────────────────────────────────────────────────
+fmt_size() {
+    awk -v mb="$1" 'BEGIN {
+        if (mb < 1)        printf "%.0f KB", mb*1024
+        else if (mb < 1024) printf "%.1f MB", mb
+        else               printf "%.2f GB", mb/1024
+    }'
+}
+
+fmt_kbps() {
+    local kbps=$1
+    if (( kbps == 0 )); then echo "?"; return; fi
+    if (( kbps >= 10000 )); then
+        awk -v k="$kbps" 'BEGIN { printf "%.1f Mb/s", k/1000 }'
+    else
+        echo "${kbps} kb/s"
+    fi
+}
+
+# ── Progress bar (pure bash + ANSI) ──────────────────────────────────────────
+SPIN_FRAMES="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_spin_idx=0
+
+show_progress() {
+    local cur=$1 total=$2 ok=$3
+    (( total == 0 )) && return
+
+    local pct=$(( cur * 100 / total ))
+    local filled=$(( cur * 30 / total ))
+
+    local bar="" i color
+    for (( i=0; i<30; i++ )); do
+        if (( i < filled )); then
+            if   (( i <  8 )); then color=$RED
+            elif (( i < 16 )); then color=$YLW
+            elif (( i < 24 )); then color=$CYN
+            else                    color=$GRN
+            fi
+            bar+="${color}█${RST}"
+        else
+            bar+="${DIM}░${RST}"
+        fi
+    done
+
+    local spin="${SPIN_FRAMES:$(( _spin_idx % ${#SPIN_FRAMES} )):1}"
+    (( _spin_idx++ )) || true
+
+    printf "\r${CYN}%s${RST} %s  ${MAG}%3d%%${RST}  (%d/%d)  ${CYN}%d ok${RST}   " \
+        "$spin" "$bar" "$pct" "$cur" "$total" "$ok" >&2
+}
+
+# ── Table printer ─────────────────────────────────────────────────────────────
+# Columns: # | Name | Res | FPS | Duration | Bitrate | VCodec | ACodec | Size
+C_N=4; C_NAME=36; C_RES=11; C_FPS=6; C_DUR=9; C_BR=10; C_VC=7; C_AC=6; C_SZ=9
+
+_pad() {
+    # _pad <text> <width> [l|r]   (l=left-align default, r=right-align)
+    local text="$1" width="$2" align="${3:-l}"
+    local visible
+    # strip ANSI for length calc
+    visible=$(echo -e "$text" | sed 's/\x1B\[[0-9;]*[A-Za-z]//g')
+    local vlen=${#visible}
+    local pad=$(( width - vlen ))
+    (( pad < 0 )) && pad=0
+    local spaces; spaces=$(printf '%*s' "$pad" '')
+    if [[ "$align" == "r" ]]; then
+        echo -e "${spaces}${text}"
+    else
+        echo -e "${text}${spaces}"
+    fi
+}
+
+_trunc() {
+    local s="$1" n="$2"
+    if (( ${#s} > n )); then
+        echo "${s:0:$(( n-1 ))}~"
+    else
+        echo "$s"
+    fi
+}
+
+_res_color() {
+    local w=$1
+    if   (( w >= 3840 )); then echo "$MAG"    # 4K+
+    elif (( w >= 1920 )); then echo "$GRN"    # FHD
+    elif (( w >= 1280 )); then echo "$CYN"    # HD
+    else                       echo "$YLW"    # SD
+    fi
+}
+
+_size_color() {
+    local mb=$1
+    local mb_int=${mb%%.*}
+    if   (( mb_int >= 1024 )); then echo "$RED"
+    elif (( mb_int >= 200  )); then echo "$YLW"
+    else                           echo "$GRN"
+    fi
+}
+
+_dur_color() {
+    local dur_int=${1%%.*}
+    if   (( dur_int >= 3600 )); then echo "$MAG"
+    elif (( dur_int >= 600  )); then echo "$CYN"
+    else                            echo "$RST"
+    fi
+}
+
+SEP="${DIM}|${RST}"
+
+print_header() {
+    local line sep_line
+    line="  $(_pad "${BLD}${CYN}#${RST}"         $C_N  r)  $SEP"
+    line+="  $(_pad "${BLD}Name${RST}"            $C_NAME  )  $SEP"
+    line+="  $(_pad "${BLD}Resolution${RST}"      $C_RES r)  $SEP"
+    line+="  $(_pad "${BLD}FPS${RST}"             $C_FPS r)  $SEP"
+    line+="  $(_pad "${BLD}Duration${RST}"        $C_DUR r)  $SEP"
+    line+="  $(_pad "${BLD}Bitrate${RST}"         $C_BR  r)  $SEP"
+    line+="  $(_pad "${BLD}Video${RST}"           $C_VC  )  $SEP"
+    line+="  $(_pad "${BLD}Audio${RST}"           $C_AC  )  $SEP"
+    line+="  $(_pad "${BLD}Size${RST}"            $C_SZ  r)"
+    local total_w=$(( C_N + C_NAME + C_RES + C_FPS + C_DUR + C_BR + C_VC + C_AC + C_SZ + 8*6 ))
+    sep_line="  ${DIM}$(printf '─%.0s' $(seq 1 $total_w))${RST}"
+    echo
+    echo -e "$line"
+    echo -e "$sep_line"
+}
+
+print_row() {
+    local n=$1 zebra=$2
+    # fields from JSON line via positional args
+    local file=$3 dur=$4 dur_str=$5 size_mb=$6 br_kbps=$7
+    local vcodec=$8 res=$9 w=${10} fps=${11} acodec=${12} arate=${13} ach=${14}
+
+    local name; name=$(basename "$file")
+    name=$(_trunc "$name" $C_NAME)
+
+    local dim_z=""
+    [[ "$zebra" == "1" ]] && dim_z="$DIM"
+
+    local rc; rc=$(_res_color "$w")
+    local sc; sc=$(_size_color "$size_mb")
+    local dc; dc=$(_dur_color "$dur")
+
+    local fps_str; fps_str=$(awk -v f="$fps" 'BEGIN { printf "%.2f", f }')
+    local sz_str; sz_str=$(fmt_size "$size_mb")
+    local br_str; br_str=$(fmt_kbps "$br_kbps")
+
+    # audio summary
+    local audio_str="$acodec"
+    [[ -z "$audio_str" ]] && audio_str="${DIM}none${RST}"
+
+    local line
+    line="  $(_pad "${dim_z}${CYN}${n}${RST}"                                  $C_N  r)  $SEP"
+    line+="  $(_pad "${dim_z}${BLD}${name}${RST}"                              $C_NAME  )  $SEP"
+    line+="  $(_pad "${rc}${res}${RST}"                                         $C_RES r)  $SEP"
+    line+="  $(_pad "${dim_z}${fps_str}${RST}"                                  $C_FPS r)  $SEP"
+    line+="  $(_pad "${dc}${dur_str}${RST}"                                     $C_DUR r)  $SEP"
+    line+="  $(_pad "${dim_z}${WHT}${br_str}${RST}"                            $C_BR  r)  $SEP"
+    line+="  $(_pad "${dim_z}${vcodec}${RST}"                                   $C_VC  )  $SEP"
+    line+="  $(_pad "${dim_z}${audio_str}${RST}"                               $C_AC  )  $SEP"
+    line+="  $(_pad "${sc}${sz_str}${RST}"                                      $C_SZ  r)"
+    echo -e "$line"
+}
+
+print_footer() {
+    local total_files=$1 failed=$2 elapsed=$3
+    # remaining args: all size_mb values then all dur values (separated by marker)
+    shift 3
+
+    local total_mb=0 total_dur=0
+    local section="size"
+    for val in "$@"; do
+        if [[ "$val" == "--" ]]; then section="dur"; continue; fi
+        if [[ "$section" == "size" ]]; then
+            total_mb=$(awk -v a="$total_mb" -v b="$val" 'BEGIN { printf "%.2f", a+b }')
+        else
+            total_dur=$(awk -v a="$total_dur" -v b="$val" 'BEGIN { printf "%.3f", a+b }')
+        fi
+    done
+
+    local total_dur_int=${total_dur%%.*}
+    local dur_h=$(( total_dur_int / 3600 ))
+    local dur_m=$(( (total_dur_int % 3600) / 60 ))
+    local dur_s=$(( total_dur_int % 60 ))
+    local dur_fmt; dur_fmt=$(printf "%02d:%02d:%02d" $dur_h $dur_m $dur_s)
+    local sz_fmt; sz_fmt=$(fmt_size "$total_mb")
+
+    local total_w=$(( C_N + C_NAME + C_RES + C_FPS + C_DUR + C_BR + C_VC + C_AC + C_SZ + 8*6 ))
+    local sep_line="  ${DIM}$(printf '─%.0s' $(seq 1 $total_w))${RST}"
+    echo -e "$sep_line"
+    echo
+    printf "  ${BLD}%-16s${RST}  ${GRN}%s${RST}" "Videos" "$total_files"
+    (( failed > 0 )) && printf "  ${DIM}(%d unreadable)${RST}" "$failed"
+    echo
+    printf "  ${BLD}%-16s${RST}  %s\n" "Total size"     "$sz_fmt"
+    printf "  ${BLD}%-16s${RST}  %s\n" "Total duration" "$dur_fmt"
+    printf "  ${BLD}%-16s${RST}  %.1fs\n" "Scan time"   "$elapsed"
+    echo
+}
+
+# ── JSON output ────────────────────────────────────────────────────────────────
+print_json() {
+    local -a lines=("$@")
+    echo "["
+    local last=$(( ${#lines[@]} - 1 ))
+    for i in "${!lines[@]}"; do
+        if (( i < last )); then
+            echo "  ${lines[$i]},"
+        else
+            echo "  ${lines[$i]}"
+        fi
+    done
+    echo "]"
+}
+
+# ── Sort helper (pure bash, awk-assisted) ─────────────────────────────────────
+sort_lines() {
+    local key="$1"; shift
+    local lines=("$@")
+
+    # extract field, attach as sort key prefix, sort, strip prefix
+    case "$key" in
+        size) field="size_mb" ;;
+        dur)  field="dur" ;;
+        fps)  field="fps" ;;
+        *)    field="" ;;   # name — already sorted by collect_files
+    esac
+
+    if [[ -z "$field" ]]; then
+        printf '%s\n' "${lines[@]}"
+        return
+    fi
+
+    printf '%s\n' "${lines[@]}" | awk -v f="$field" '
+    {
+        line = $0
+        val = 0
+        # find "field":value
+        if (match($0, "\""f"\":[0-9.]+")) {
+            s = substr($0, RSTART+length(f)+3)
+            val = s+0
+        }
+        printf "%020.6f\t%s\n", val, line
+    }' | sort -rn -k1 | cut -f2-
+}
+
+# ── Scan a single file ────────────────────────────────────────────────────────
+scan_one() {
+    local file="$1"
+    log_info "Reading: $(basename "$file")"
+
+    local info
+    info=$(probe_file "$file") || { log_err "Cannot read: $(basename "$file")"; exit 1; }
+
+    if [[ $JSON_OUT -eq 1 ]]; then
+        echo "[$info]"
+        return
+    fi
+
+    # parse fields from JSON line
+    local dur dur_str size_mb br_kbps vcodec res w fps acodec arate ach
+    dur=$(      echo "$info" | grep -oP '"dur":\K[0-9.]+')
+    dur_str=$(  echo "$info" | grep -oP '"dur_str":"\K[^"]+')
+    size_mb=$(  echo "$info" | grep -oP '"size_mb":\K[0-9.]+')
+    br_kbps=$(  echo "$info" | grep -oP '"br_kbps":\K[0-9]+')
+    vcodec=$(   echo "$info" | grep -oP '"vcodec":"\K[^"]+')
+    res=$(      echo "$info" | grep -oP '"res":"\K[^"]+')
+    w=$(        echo "$info" | grep -oP '"w":\K[0-9]+')
+    fps=$(      echo "$info" | grep -oP '"fps":\K[0-9.]+')
+    acodec=$(   echo "$info" | grep -oP '"acodec":"\K[^"]+')
+    arate=$(    echo "$info" | grep -oP '"arate":\K[0-9]+')
+    ach=$(      echo "$info" | grep -oP '"ach":\K[0-9]+')
+
+    print_header
+    print_row 1 0 "$file" "$dur" "$dur_str" "$size_mb" "$br_kbps" \
+        "$vcodec" "$res" "$w" "$fps" "$acodec" "$arate" "$ach"
+    print_footer 1 0 0 "$size_mb" -- "$dur"
+}
+
+# ── Scan a folder ─────────────────────────────────────────────────────────────
+scan_folder() {
+    local dir="$1"
+    log_info "Scanning: $dir"
+
+    # collect video files
+    local -a all_files=()
+    while IFS= read -r f; do
+        is_video "$f" && all_files+=("$f")
+    done < <(collect_files "$dir")
+
+    if [[ ${#all_files[@]} -eq 0 ]]; then
+        log_warn "No video files found."
+        exit 0
+    fi
+
+    # apply --min filter
+    local -a files=()
+    local skipped=0
+    for f in "${all_files[@]}"; do
+        local sz
+        sz=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+        local mb
+        mb=$(awk -v s="$sz" 'BEGIN { printf "%.2f", s/1048576 }')
+        local mb_int=${mb%%.*}
+        if awk -v mb="$mb" -v min="$MIN_MB" 'BEGIN { exit !(mb >= min) }'; then
+            files+=("$f")
+        else
+            (( skipped++ )) || true
+        fi
+    done
+
+    if (( skipped > 0 )); then
+        log_info "Skipped $skipped file(s) smaller than ${MIN_MB} MB."
+    fi
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_warn "No files match the filter."
+        exit 0
+    fi
+
+    local total=${#files[@]}
+    log_ok "Found $total video(s) — scanning with $JOBS job(s)..."
+
+    # ── parallel probe ────────────────────────────────────────────────────────
+    local tmpdir; tmpdir=$(mktemp -d)
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    local -a pids=()
+    local sem=0
+
+    for i in "${!files[@]}"; do
+        probe_file "${files[$i]}" > "${tmpdir}/${i}.json" 2>/dev/null &
+        pids+=($!)
+        (( sem++ )) || true
+        if (( sem >= JOBS )); then
+            wait "${pids[$(( ${#pids[@]} - JOBS ))]}" 2>/dev/null || true
+            (( sem-- )) || true
+        fi
+    done
+
+    # wait for all and show progress
+    local done_count=0 ok_count=0 failed=0
+    local t_start=$SECONDS
+
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" 2>/dev/null || true
+        (( done_count++ )) || true
+        if [[ -s "${tmpdir}/${i}.json" ]]; then
+            (( ok_count++ )) || true
+        else
+            (( failed++ )) || true
+        fi
+        show_progress "$done_count" "$total" "$ok_count"
+    done
+
+    echo >&2   # newline after progress
+
+    # ── collect results in original order ─────────────────────────────────────
+    local -a raw_lines=()
+    for i in "${!files[@]}"; do
+        if [[ -s "${tmpdir}/${i}.json" ]]; then
+            raw_lines+=("$(cat "${tmpdir}/${i}.json")")
+        fi
+    done
+
+    # ── sort ──────────────────────────────────────────────────────────────────
+    local -a sorted_lines=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && sorted_lines+=("$line")
+    done < <(sort_lines "$SORT_KEY" "${raw_lines[@]}")
+
+    # ── JSON mode ─────────────────────────────────────────────────────────────
+    if [[ $JSON_OUT -eq 1 ]]; then
+        print_json "${sorted_lines[@]}"
+        return
+    fi
+
+    # ── table output ──────────────────────────────────────────────────────────
+    print_header
+
+    local row_n=0
+    local -a size_vals=() dur_vals=()
+
+    for info in "${sorted_lines[@]}"; do
+        (( row_n++ )) || true
+        local zebra=$(( row_n % 2 ))
+
+        local file dur dur_str size_mb br_kbps vcodec res w fps acodec arate ach
+        file=$(    echo "$info" | grep -oP '"file":"\K[^"]+')
+        dur=$(     echo "$info" | grep -oP '"dur":\K[0-9.]+')
+        dur_str=$( echo "$info" | grep -oP '"dur_str":"\K[^"]+')
+        size_mb=$( echo "$info" | grep -oP '"size_mb":\K[0-9.]+')
+        br_kbps=$( echo "$info" | grep -oP '"br_kbps":\K[0-9]+')
+        vcodec=$(  echo "$info" | grep -oP '"vcodec":"\K[^"]+')
+        res=$(     echo "$info" | grep -oP '"res":"\K[^"]+')
+        w=$(       echo "$info" | grep -oP '"w":\K[0-9]+')
+        fps=$(     echo "$info" | grep -oP '"fps":\K[0-9.]+')
+        acodec=$(  echo "$info" | grep -oP '"acodec":"\K[^"]+')
+        arate=$(   echo "$info" | grep -oP '"arate":\K[0-9]+')
+        ach=$(     echo "$info" | grep -oP '"ach":\K[0-9]+')
+
+        print_row "$row_n" "$zebra" "$file" "$dur" "$dur_str" "$size_mb" "$br_kbps" \
+            "$vcodec" "$res" "$w" "$fps" "$acodec" "$arate" "$ach"
+
+        size_vals+=("$size_mb")
+        dur_vals+=("$dur")
+    done
+
+    local elapsed=$(( SECONDS - t_start ))
+    print_footer "$row_n" "$failed" "$elapsed" "${size_vals[@]}" -- "${dur_vals[@]}"
+
+    (( failed > 0 )) && log_warn "$failed file(s) could not be read."
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if [[ -f "$INPUT" ]]; then
+    scan_one "$INPUT"
+elif [[ -d "$INPUT" ]]; then
+    scan_folder "$INPUT"
+else
+    log_err "Not a file or directory: $INPUT"
+    exit 1
+fi
