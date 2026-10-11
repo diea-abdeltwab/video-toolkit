@@ -43,8 +43,8 @@ brew install ffmpeg
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/diea-abdeltwab/vidkit.git
-cd vidkit
+git clone https://github.com/diea-abdeltwab/video-toolkit.git
+cd video-toolkit
 chmod +x vid-info vid-cut vid-2-img
 
 # optional: make them available anywhere on your system
